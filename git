@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Enforce repository Git identities before Git can publish identity data."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+CONFIG_PATH = Path(os.environ.get("GIT_COMMIT_PROXY_CONFIG", "~/.config/git-commit-proxy/config.json")).expanduser()
+IDENTITY_KEYS = {"user.name", "user.email"}
+PUBLIC_COMMANDS = {
+    "commit", "commit-tree", "merge", "pull", "cherry-pick", "revert", "am", "rebase", "stash",
+    "tag", "notes", "filter-branch", "fast-import", "send-email",
+}
+
+
+def fail(message: str, code: int = 1) -> int:
+    print(f"[git-commit-proxy] blocked: {message}", file=sys.stderr)
+    return code
+
+
+def real_git() -> str:
+    override = os.environ.get("GIT_COMMIT_PROXY_REAL_GIT")
+    if override:
+        return override
+    paths = os.environ.get("PATH", "").split(os.pathsep)
+    own_dir = str(Path(__file__).resolve().parent)
+    for directory in paths:
+        if not directory or str(Path(directory).resolve()) == own_dir:
+            continue
+        candidate = Path(directory) / "git"
+        if candidate.is_file() and os.access(candidate, os.X_OK) and candidate.resolve() != Path(__file__).resolve():
+            return str(candidate)
+    raise RuntimeError("cannot find the real git executable outside the proxy directory")
+
+
+def run_git(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    capture: bool = False,
+    input_data: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [real_git(), *args],
+        env=env,
+        text=True,
+        input=input_data,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+
+
+def init_config() -> int:
+    if CONFIG_PATH.exists():
+        return fail(f"configuration already exists: {CONFIG_PATH}")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "version": 1,
+        "identities": [],
+    }
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(f"Created {CONFIG_PATH}")
+    print("Add allowed identities before you create or publish identity-bearing Git data.")
+    return 0
+
+
+def load_config() -> dict[str, Any]:
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(f"configuration is missing; run 'git proxy init' ({CONFIG_PATH})") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read configuration: {error}") from error
+    if config.get("version") != 1 or not isinstance(config.get("identities"), list):
+        raise ValueError("configuration must contain version 1 and an identities list")
+    return config
+
+
+def config_write_target(args: list[str]) -> tuple[str | None, list[str]]:
+    """Return the target key and positional values for `git config` commands."""
+    values: list[str] = []
+    for arg in args:
+        if arg.startswith("--"):
+            continue
+        values.append(arg)
+    key = next((value.lower() for value in values if "." in value and not value.startswith("/")), None)
+    return key, values
+
+
+def check_config_write(args: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    key, values = config_write_target(args)
+    operation_flags = {arg.split("=", 1)[0] for arg in args if arg.startswith("--")}
+    if "--edit" in operation_flags:
+        return "opaque git config edits are not allowed; use a specific config command"
+    if operation_flags & {"--rename-section", "--remove-section"} and any(value.lower() == "user" for value in values):
+        return "changing the user config section is not allowed"
+    if key not in IDENTITY_KEYS:
+        return None
+    if operation_flags & {"--unset", "--unset-all", "--rename-section", "--remove-section"}:
+        return None
+    if len(values) == 1 and not operation_flags.intersection({"--add", "--replace-all", "--file", "--global", "--local", "--system", "--worktree"}):
+        return None
+    supplied = values[-1] if len(values) > 1 else None
+    field_index = 0 if key == "user.name" else 1
+    if not any(identity[field_index] == supplied for identity in allowed):
+        return f"{key} value {supplied!r} is not in the identity allow-list"
+    return None
+
+
+def parse_git_command(args: list[str]) -> tuple[str | None, list[str]]:
+    """Find the Git subcommand while skipping global options with values."""
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == "--":
+            return None, args[i + 1:]
+        if token in value_options:
+            i += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return token, args[i + 1:]
+    return None, []
+
+
+def apply_directory_options(args: list[str]) -> list[str]:
+    """Apply Git's global -C options so policy checks use Git's working directory."""
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+    result: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "-C" and index + 1 < len(args):
+            os.chdir(Path(args[index + 1]).resolve())
+            index += 2
+            continue
+        if token.startswith("-C") and len(token) > 2:
+            os.chdir(Path(token[2:]).resolve())
+            index += 1
+            continue
+        if token in value_options and index + 1 < len(args):
+            result.extend(args[index:index + 2])
+            index += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            result.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            result.append(token)
+            index += 1
+            continue
+        result.extend(args[index:])
+        break
+    return result
+
+
+def expand_aliases(args: list[str]) -> tuple[list[str], str | None]:
+    git = real_git()
+    command_list = subprocess.run(
+        [git, "--list-cmds=main,others,nohelpers"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    known_commands = set(command_list.stdout.split())
+    for _ in range(10):
+        command, subargs = parse_git_command(args)
+        if not command or command in known_commands:
+            return args, None
+        prefix_length = len(args) - len(subargs) - 1
+        prefix = args[:prefix_length]
+        result = subprocess.run(
+            [git, *prefix, "config", "--get", f"alias.{command}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode:
+            return args, None
+        target = result.stdout.strip()
+        if target.startswith("!"):
+            return args, None
+        try:
+            words = shlex.split(target)
+        except ValueError:
+            return args, f"cannot parse Git alias {command!r}"
+        if not words:
+            return args, f"Git alias {command!r} is empty"
+        args = [*prefix, *words, *subargs]
+    return args, "Git alias expansion exceeds 10 levels"
+
+
+def patch_from_identities(data: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    data = data.replace("\r\n", "\n")
+    messages = re.split(r"(?m)^From [0-9a-f]{7,64} \w{3} .*$", data)
+    for message in messages:
+        headers = message.split("\n\n", 1)[0]
+        for name, email in re.findall(r"^From: (.*?)\s*<([^<>]+)>\s*$", headers, flags=re.MULTILINE):
+            normalized_name = name.strip().strip('"').replace('\\"', '"')
+            found.add((normalized_name, email.strip()))
+    return found
+
+
+def allowed_identity_set(config: dict[str, Any]) -> set[tuple[str, str]]:
+    allowed: set[tuple[str, str]] = set()
+    for identity in config["identities"]:
+        if isinstance(identity, dict) and isinstance(identity.get("name"), str) and isinstance(identity.get("email"), str):
+            allowed.add((identity["name"], identity["email"]))
+    return allowed
+
+
+def check_authors(git: str, revisions: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    commits: list[str] = []
+    for revision in revisions:
+        result = subprocess.run(
+            [git, "rev-list", "--reverse", revision],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            return f"cannot inspect commit range {revision!r}: {result.stderr.strip()}"
+        commits.extend(line for line in result.stdout.splitlines() if line)
+    return check_commit_ids(git, list(dict.fromkeys(commits)), allowed)
+
+
+def check_commit_ids(git: str, commits: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    for commit in dict.fromkeys(commits):
+        result = subprocess.run(
+            [git, "show", "-s", "--format=%an%x00%ae", commit],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            return f"cannot inspect author identity for commit {commit}"
+        fields = result.stdout.rstrip("\n").split("\x00")
+        if len(fields) != 2 or (fields[0], fields[1]) not in allowed:
+            email = fields[1] if len(fields) > 1 else "unknown"
+            return f"commit {commit} has an author identity outside the allow-list: {email}"
+    return None
+
+
+def check_history_identities(git: str, revisions: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    commits: list[str] = []
+    for revision in revisions:
+        result = subprocess.run(
+            [git, "rev-list", "--reverse", revision],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            return f"cannot inspect commit range {revision!r}: {result.stderr.strip()}"
+        commits.extend(line for line in result.stdout.splitlines() if line)
+    for commit in dict.fromkeys(commits):
+        result = subprocess.run(
+            [git, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", commit],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            return f"cannot inspect identities for commit {commit}"
+        fields = result.stdout.rstrip("\n").split("\x00")
+        if len(fields) != 4:
+            return f"cannot parse identities for commit {commit}"
+        for name, email in ((fields[0], fields[1]), (fields[2], fields[3])):
+            if (name, email) not in allowed:
+                return f"commit {commit} has an identity outside the allow-list: {email}"
+    return None
+
+
+def check_selected_authors(git: str, revisions: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    commits: list[str] = []
+    for revision in revisions:
+        if ".." in revision or revision.startswith("^"):
+            result = subprocess.run(
+                [git, "rev-list", "--reverse", revision],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode:
+                return f"cannot inspect commit selection {revision!r}: {result.stderr.strip()}"
+            commits.extend(line for line in result.stdout.splitlines() if line)
+        else:
+            result = subprocess.run(
+                [git, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode:
+                return f"cannot inspect commit {revision!r}: {result.stderr.strip()}"
+            commits.append(result.stdout.strip())
+    return check_commit_ids(git, commits, allowed)
+
+
+def revision_arguments(args: list[str], command: str) -> list[str]:
+    """Return revision arguments for commands that preserve commit authors."""
+    value_options = {"-m", "--mainline", "--strategy", "--strategy-option", "--gpg-sign"}
+    revisions: list[str] = []
+    i = 1
+    while i < len(args):
+        token = args[i]
+        if token in value_options:
+            i += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        revisions.append(token)
+        i += 1
+    return revisions
+
+
+def check_rebase_authors(git: str, args: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    revisions = revision_arguments(args, "rebase")
+    root_mode = "--root" in args
+    onto: str | None = None
+    if "--onto" in args:
+        index = args.index("--onto")
+        if index + 1 >= len(args):
+            return "rebase --onto needs a new base"
+        onto = args[index + 1]
+        revisions = revisions[1:]
+    if root_mode:
+        branch = revisions[-1] if revisions else "HEAD"
+        return check_authors(git, [branch], allowed)
+    if len(revisions) >= 2:
+        upstream, branch = revisions[-2], revisions[-1]
+    elif revisions:
+        upstream, branch = revisions[0], "HEAD"
+    else:
+        result = subprocess.run(
+            [git, "rev-parse", "--symbolic-full-name", "@{upstream}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            return f"cannot determine rebase upstream: {result.stderr.strip()}"
+        upstream, branch = result.stdout.strip(), "HEAD"
+    range_start = upstream
+    if "--fork-point" in args:
+        fork = subprocess.run(
+            [git, "merge-base", "--fork-point", upstream, branch],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if fork.returncode:
+            return f"cannot determine rebase fork point: {fork.stderr.strip()}"
+        range_start = fork.stdout.strip()
+    revision = f"{range_start}..{branch}"
+    if onto:
+        # The new base does not change which source commits Git will replay.
+        pass
+    return check_authors(git, [revision], allowed)
+
+
+def check_patch_files(paths: list[str], allowed: set[tuple[str, str]]) -> tuple[str | None, str | None]:
+    stdin_data: str | None = None
+    for path in paths:
+        if path == "-":
+            if stdin_data is None:
+                stdin_data = sys.stdin.read()
+            content = stdin_data
+        else:
+            try:
+                source = Path(path)
+                if source.is_dir():
+                    child_patches = sorted(source.glob("*.patch"))
+                    if not child_patches:
+                        return None, f"patch directory {path!r} contains no .patch files"
+                    paths.extend(str(child) for child in child_patches)
+                    continue
+                content = source.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                return None, f"cannot inspect patch {path!r}: {error}"
+        identities = patch_from_identities(content)
+        if not identities:
+            return None, f"patch {path!r} has no readable From identity"
+        for identity in identities:
+            if identity not in allowed:
+                return None, f"patch {path!r} has an author identity outside the allow-list: {identity[1]}"
+    return stdin_data, None
+
+
+def check_fast_import(data: str, allowed: set[tuple[str, str]], default_committer: tuple[str, str]) -> str | None:
+    blocks = re.split(r"(?m)^commit ", data)[1:]
+    for block in blocks:
+        identities: dict[str, list[tuple[str, str]]] = {"author": [], "committer": []}
+        for kind, value in re.findall(r"^(author|committer) (.*)$", block, flags=re.MULTILINE):
+            match = re.fullmatch(r"(.*) <([^<>]+)> -?\d+ [+-]\d{4}", value)
+            if not match:
+                return f"fast-import has an unreadable {kind} identity"
+            identities[kind].append((match.group(1), match.group(2)))
+        committers = identities["committer"] or [default_committer]
+        authors = identities["author"] or committers
+        for kind, values in (("author", authors), ("committer", committers)):
+            for source_identity in values:
+                if source_identity not in allowed:
+                    return f"fast-import has a {kind} identity outside the allow-list: {source_identity[1]}"
+    return None
+
+
+def effective_identity(git: str, args: list[str], variable: str) -> tuple[str, str] | str:
+    command, subargs = parse_git_command(args)
+    prefix_length = len(args) - len(subargs) - (1 if command else 0)
+    prefix = args[:prefix_length]
+    result = subprocess.run(
+        [git, *prefix, "var", variable],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        return result.stderr.strip() or f"cannot resolve {variable}"
+    match = re.fullmatch(r"(.*) <([^<>]+)> -?\d+ [+-]\d{4}\s*", result.stdout)
+    if not match:
+        return f"cannot parse {variable}"
+    return match.group(1), match.group(2)
+
+
+def check_effective_identity(git: str, args: list[str], variable: str, allowed: set[tuple[str, str]]) -> str | None:
+    identity = effective_identity(git, args, variable)
+    if isinstance(identity, str):
+        return f"cannot check Git identity: {identity}"
+    if identity not in allowed:
+        return f"{variable} identity is outside the allow-list: {identity[1]}"
+    return None
+
+
+def check_explicit_author(args: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    for index, arg in enumerate(args):
+        value: str | None = None
+        if arg.startswith("--author="):
+            value = arg.split("=", 1)[1]
+        elif arg == "--author" and index + 1 < len(args):
+            value = args[index + 1]
+        if value is None:
+            continue
+        match = re.fullmatch(r"(.+?)\s*<([^<>]+)>", value)
+        if not match or (match.group(1).strip(), match.group(2).strip()) not in allowed:
+            return "--author identity is outside the allow-list"
+    return None
+
+
+def patch_operands(args: list[str], command: str) -> list[str]:
+    value_options = {
+        "am": {"--directory", "--exclude", "--include", "--resolvemsg", "--patch-format"},
+        "send-email": {
+            "--from", "--to", "--cc", "--bcc", "--subject", "--in-reply-to", "--cc-cmd", "--envelope-sender",
+            "--reply-to", "--smtp-auth", "--smtp-domain", "--smtp-server-option", "--suppress-cc",
+            "--smtp-server", "--smtp-server-port", "--smtp-encryption", "--smtp-user", "--smtp-pass",
+            "--transfer-encoding", "--identity",
+        },
+    }[command]
+    paths: list[str] = []
+    i = 1
+    while i < len(args):
+        token = args[i]
+        if token in value_options:
+            i += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in value_options):
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        paths.append(token)
+        i += 1
+    return paths
+
+
+def check_send_email_identity(git: str, args: list[str], allowed: set[tuple[str, str]]) -> str | None:
+    for index, arg in enumerate(args):
+        sender = None
+        if arg.startswith("--from="):
+            sender = arg.split("=", 1)[1]
+        elif arg == "--from" and index + 1 < len(args):
+            sender = args[index + 1]
+        if sender is not None:
+            match = re.search(r"<([^<>]+)>", sender)
+            email = match.group(1).strip() if match else sender.strip()
+            name = sender[:match.start()].strip().strip('"') if match else None
+            if not any(allowed_email == email and (name is None or allowed_name == name) for allowed_name, allowed_email in allowed):
+                return f"send-email From identity is outside the allow-list: {email}"
+    result = subprocess.run(
+        [git, "config", "--get", "sendemail.from"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        configured = result.stdout.strip()
+        match = re.search(r"<([^<>]+)>", configured)
+        email = match.group(1).strip() if match else configured
+        name = configured[:match.start()].strip().strip('"') if match else None
+        if not any(allowed_email == email and (name is None or allowed_name == name) for allowed_name, allowed_email in allowed):
+            return f"configured send-email From identity is outside the allow-list: {email}"
+    return None
+
+
+def check_filter_identity_script(script: str, allowed: set[tuple[str, str]]) -> str | None:
+    identity_vars = {
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    }
+    assignments: dict[str, str] = {}
+    assignment_pattern = re.compile(
+        r"(?:^|[;\n])\s*(?:export\s+)?(GIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL))\s*=\s*"
+        r"(?:'([^']*)'|\"([^\"$`]*)\"|([^\s;]+))"
+    )
+    for match in assignment_pattern.finditer(script):
+        value = next(group for group in match.groups()[1:] if group is not None)
+        if "$" in value or "`" in value:
+            return f"filter identity assignment for {match.group(1)} is dynamic and cannot be checked"
+        assignments[match.group(1)] = value
+    for variable in identity_vars:
+        if re.search(rf"\b{variable}\s*=", script) and variable not in assignments:
+            return f"filter identity assignment for {variable} cannot be checked"
+
+    author_bases = list(allowed)
+    transformed_authors = {
+        (
+            assignments.get("GIT_AUTHOR_NAME", name),
+            assignments.get("GIT_AUTHOR_EMAIL", email),
+        )
+        for name, email in author_bases
+    }
+    if not transformed_authors.issubset(allowed):
+        return "filter-branch author identity assignment is outside the allow-list"
+
+    committer_bases = list(allowed)
+    transformed_committers = {
+        (
+            assignments.get("GIT_COMMITTER_NAME", name),
+            assignments.get("GIT_COMMITTER_EMAIL", email),
+        )
+        for name, email in committer_bases
+    }
+    if not transformed_committers.issubset(allowed):
+        return "filter-branch committer identity assignment is outside the allow-list"
+    return None
+
+
+def format_patch(args: list[str], env: dict[str, str], allowed: set[tuple[str, str]]) -> int:
+    if "--stdout" in args or "--stdout" in args[1:]:
+        result = run_git(args, env=env, capture=True)
+        if result.returncode:
+            sys.stderr.write(result.stderr or "")
+            return result.returncode
+        found = patch_from_identities(result.stdout)
+        if not found or not found.issubset(allowed):
+            return fail("format-patch would publish an author identity outside the allow-list")
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr or "")
+        return 0
+
+    rewritten = list(args)
+    output_dir: str | None = None
+    i = 1
+    while i < len(rewritten):
+        token = rewritten[i]
+        if token in ("-o", "--output-directory"):
+            if i + 1 >= len(rewritten):
+                return fail(f"{token} needs a directory")
+            output_dir = rewritten[i + 1]
+            del rewritten[i:i + 2]
+            continue
+        if token.startswith("--output-directory="):
+            output_dir = token.split("=", 1)[1]
+            del rewritten[i]
+            continue
+        i += 1
+
+    target_dir = Path(output_dir or ".").resolve()
+    with tempfile.TemporaryDirectory(prefix="git-commit-proxy-") as temporary:
+        rewritten.extend(["--output-directory", temporary])
+        result = run_git(rewritten, env=env, capture=True)
+        if result.returncode:
+            sys.stderr.write(result.stderr or "")
+            return result.returncode
+        files = sorted(Path(temporary).glob("*.patch"))
+        for path in files:
+            found = patch_from_identities(path.read_text(encoding="utf-8", errors="replace"))
+            if not found or not found.issubset(allowed):
+                return fail(f"format-patch would publish an author identity outside the allow-list ({path.name})")
+        for path in files:
+            destination = target_dir / path.name
+            if destination.exists():
+                return fail(f"format-patch output already exists: {destination}")
+        if files:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        for path in files:
+            shutil.move(str(path), str(target_dir / path.name))
+        sys.stderr.write(result.stderr or "")
+        return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:2] == ["proxy", "init"]:
+        return init_config()
+    if argv and argv[0] == "proxy":
+        try:
+            config = load_config()
+            git = real_git()
+        except (ValueError, RuntimeError) as error:
+            return fail(str(error))
+        if len(argv) == 2 and argv[1] == "status":
+            allowed = allowed_identity_set(config)
+            for variable in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+                identity = effective_identity(git, [], variable)
+                if isinstance(identity, str):
+                    return fail(identity)
+                state = "allowed" if identity in allowed else "outside allow-list"
+                print(f"{variable}: {identity[0]} <{identity[1]}> ({state})")
+            return 0
+        return fail("usage: git proxy init | git proxy status")
+
+    try:
+        argv = apply_directory_options(argv)
+    except OSError as error:
+        return fail(f"cannot enter the Git -C directory: {error}")
+    try:
+        argv, alias_error = expand_aliases(argv)
+    except RuntimeError as error:
+        return fail(str(error))
+    if alias_error:
+        return fail(alias_error)
+    command, subargs = parse_git_command(argv)
+    if argv and argv[0] in {"--version", "-v"}:
+        return run_git(argv, env=os.environ.copy()).returncode
+    try:
+        git = real_git()
+        config = load_config()
+    except (ValueError, RuntimeError) as error:
+        return fail(str(error))
+    allowed = allowed_identity_set(config)
+    if command == "config":
+        reason = check_config_write(subargs, allowed)
+        if reason:
+            return fail(reason)
+        return run_git(argv, env=os.environ.copy()).returncode
+    if command == "format-patch":
+        return format_patch(argv, os.environ.copy(), allowed)
+    if command in PUBLIC_COMMANDS:
+        author_error = check_explicit_author(subargs, allowed)
+        if author_error:
+            return fail(author_error)
+        if command == "cherry-pick" and "--no-commit" not in subargs and not any(
+            arg in {"--abort", "--quit"} for arg in subargs
+        ):
+            revisions = revision_arguments(argv, command)
+            cherry_stdin: str | None = None
+            if "--stdin" in subargs:
+                cherry_stdin = sys.stdin.read()
+                revisions.extend(line.strip() for line in cherry_stdin.splitlines() if line.strip())
+            reason = check_selected_authors(git, revisions, allowed)
+            if reason:
+                return fail(reason)
+            if cherry_stdin is not None:
+                identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+                return run_git(argv, env=os.environ.copy(), input_data=cherry_stdin).returncode
+            identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+            if identity_error:
+                return fail(identity_error)
+        if command == "rebase":
+            control_operation = any(arg in {"--abort", "--continue", "--skip", "--edit-todo"} for arg in subargs)
+            if not control_operation:
+                reason = check_rebase_authors(git, argv, allowed)
+                if reason:
+                    return fail(reason)
+            if "--abort" not in subargs:
+                identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+        if command == "am":
+            control_operation = any(
+                arg in {"--abort", "--continue", "--skip", "--retry"} or arg.startswith("--show-current-patch")
+                for arg in subargs
+            )
+            if not control_operation:
+                paths = patch_operands(argv, command)
+                stdin_data, reason = check_patch_files(paths or ["-"], allowed)
+                if reason:
+                    return fail(reason)
+                identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+                if stdin_data is not None:
+                    return run_git(argv, env=os.environ.copy(), input_data=stdin_data).returncode
+            elif not any(arg in {"--abort", "--show-current-patch"} for arg in subargs):
+                identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+        if command == "send-email":
+            reason = check_send_email_identity(git, argv, allowed)
+            if reason:
+                return fail(reason)
+            paths = patch_operands(argv, command)
+            if paths:
+                _, reason = check_patch_files(paths, allowed)
+                if reason:
+                    return fail(reason)
+            identity_error = check_effective_identity(git, argv, "GIT_AUTHOR_IDENT", allowed)
+            if identity_error:
+                return fail(identity_error)
+        if command == "fast-import":
+            stream = sys.stdin.read()
+            committer = effective_identity(git, argv, "GIT_COMMITTER_IDENT")
+            if isinstance(committer, str):
+                return fail(f"cannot resolve fast-import default identity: {committer}")
+            reason = check_fast_import(stream, allowed, committer)
+            if reason:
+                return fail(reason)
+            return run_git(argv, env=os.environ.copy(), input_data=stream).returncode
+        if command == "filter-branch":
+            if "--all" in argv:
+                refs = ["--all"]
+            elif "--" in argv:
+                refs = argv[argv.index("--") + 1:]
+            else:
+                refs = ["HEAD"]
+            reason = check_history_identities(git, refs, allowed)
+            if reason:
+                return fail(reason)
+            for index, arg in enumerate(argv):
+                if arg in {"--env-filter", "--commit-filter"} and index + 1 < len(argv):
+                    script = argv[index + 1]
+                    reason = check_filter_identity_script(script, allowed)
+                    if reason:
+                        return fail(reason)
+        if command == "tag":
+            annotated = any(arg in {"-a", "-s", "-u", "--annotate", "--sign", "--local-user", "--force-sign"} or arg.startswith("--local-user=") for arg in subargs)
+            if annotated:
+                identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+        elif command == "notes":
+            writes_notes = bool(subargs and subargs[0] in {"add", "append", "edit", "merge", "remove", "prune"})
+            if writes_notes:
+                variables = ("GIT_COMMITTER_IDENT",) if any(
+                    arg == "--author" or arg.startswith("--author=") for arg in subargs
+                ) else ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT")
+                for variable in variables:
+                    identity_error = check_effective_identity(git, argv, variable, allowed)
+                    if identity_error:
+                        return fail(identity_error)
+        elif command in {"commit", "commit-tree"}:
+            if not any(arg == "--author" or arg.startswith("--author=") for arg in subargs):
+                identity_error = check_effective_identity(git, argv, "GIT_AUTHOR_IDENT", allowed)
+                if identity_error:
+                    return fail(identity_error)
+            identity_error = check_effective_identity(git, argv, "GIT_COMMITTER_IDENT", allowed)
+            if identity_error:
+                return fail(identity_error)
+        elif command in {"merge", "pull", "revert", "stash"}:
+            if command == "stash":
+                writes_object = not subargs or subargs[0] in {"push", "save", "create"}
+            elif command == "revert":
+                writes_object = "--no-commit" not in subargs and not any(arg in {"--abort", "--quit", "--continue"} for arg in subargs)
+            elif command == "merge":
+                writes_object = "--no-commit" not in subargs and not any(arg in {"--abort", "--quit"} for arg in subargs)
+            else:
+                writes_object = True
+            if writes_object:
+                for variable in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+                    identity_error = check_effective_identity(git, argv, variable, allowed)
+                    if identity_error:
+                        return fail(identity_error)
+    result = run_git(argv, env=os.environ.copy())
+    return result.returncode
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"[git-commit-proxy] error: {error}")
